@@ -1,0 +1,73 @@
+<div class="app-container">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <h2>Known Faces</h2>
+
+      <button (click)="triggerSnapshot()" class="action-btn btn-capture">
+        Enroll Current Frame
+      </button>
+
+      <button (click)="toggleColorMode()" class="action-btn btn-mode">
+        Mode: {{ recognitionService.useBGR() ? 'BGR' : 'RGB' }}
+      </button>
+
+      <label class="upload-btn">
+        <input type="file" (change)="handleUpload($event)" accept="image/*" multiple hidden>
+        <span>+ Upload Files</span>
+      </label>
+    </div>
+
+    <div class="faces-list">
+      @for (face of knownFaces(); track face.timestamp) {
+      <div class="face-card">
+        <img [src]="face.imageUrl || 'assets/placeholder.png'" alt="Face">
+        <div class="face-info">
+          <span class="name">{{ face.name }}</span>
+          <span class="date">{{ face.timestamp | date:'shortTime' }}</span>
+        </div>
+        <button class="delete-btn" (click)="deleteFace(face); $event.stopPropagation()" title="Delete">
+          &times;
+        </button>
+      </div>
+      }
+      @if (knownFaces().length === 0) {
+      <div class="empty-state">No known faces yet.</div>
+      }
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="main-content">
+    <header class="top-bar">
+      <h1>EdgeFace Identifier</h1>
+      <div class="status-indicator">
+        <span class="match-status" *ngIf="currentMatch() !== 'Unknown'"
+          style="color: #00ff00; margin-right: 15px; font-weight: bold;">
+          Result: {{ currentMatch() }}
+        </span>
+        <span class="fps" *ngIf="fps() > 0">FPS: {{ fps() }}</span>
+        <span class="live-dot" [class.active]="isCameraActive()"></span>
+        {{ isCameraActive() ? 'Live' : 'Offline' }}
+      </div>
+    </header>
+
+    <div class="viewport-container">
+      @if (isLoading()) {
+      <div class="loading-overlay">
+        <div class="spinner"></div>
+        <p>Loading Models (EdgeFace & MediaPipe)...</p>
+      </div>
+      }
+
+      @if (!isCameraActive() && !isLoading()) {
+      <button class="start-btn" (click)="startApp()">Launch Camera</button>
+      }
+
+      <div class="video-wrapper" [class.hidden]="!isCameraActive()">
+        <video #videoElement playsinline muted></video>
+        <canvas #canvasElement></canvas>
+      </div>
+    </div>
+  </main>
+</div>
