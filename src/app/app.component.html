@@ -1,6 +1,14 @@
-<div class="app-container">
+<div class="app-container" [class.sidebar-open]="showSidebar()">
+  <!-- Mobile Menu Button -->
+  <button class="mobile-menu-btn" (click)="toggleSidebar()" *ngIf="isCameraActive()">
+    ☰
+  </button>
+
+  <!-- Sidebar Overlay (mobile) -->
+  <div class="sidebar-overlay" *ngIf="showSidebar()" (click)="toggleSidebar()"></div>
+
   <!-- Sidebar -->
-  <aside class="sidebar">
+  <aside class="sidebar" [class.open]="showSidebar()">
     <div class="sidebar-header">
       <h2>Known Faces</h2>
 
@@ -56,7 +64,7 @@
       @if (isLoading()) {
       <div class="loading-overlay">
         <div class="spinner"></div>
-        <p>Loading Models (EdgeFace & MediaPipe)...</p>
+        <p>Loading Models (EdgeFace &amp; MediaPipe)...</p>
       </div>
       }
 

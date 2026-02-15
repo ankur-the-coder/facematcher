@@ -14,7 +14,7 @@ export class FaceRecognitionService {
     private worker: Worker | null = null;
     isModelLoaded = signal<boolean>(false);
     knownFaces = signal<KnownFace[]>([]);
-    useBGR = signal<boolean>(true);
+    useBGR = signal<boolean>(false); // Default to RGB for better results
 
     private pendingRequests = new Map<string, { resolve: (v: any) => void, reject: (e: any) => void }>();
 
@@ -32,7 +32,7 @@ export class FaceRecognitionService {
                 switch (type) {
                     case 'MODEL_LOADED':
                         this.isModelLoaded.set(payload);
-                        console.log('EdgeFace Model Loaded via Worker');
+                        console.log('EdgeFace Model Loaded via Worker (CPU/WASM)');
                         break;
                     case 'RESULT':
                         if (id && this.pendingRequests.has(id)) {
@@ -50,24 +50,30 @@ export class FaceRecognitionService {
                 }
             };
 
-            // Load Model
+            // Load Model (CPU-only)
             this.worker.postMessage({ type: 'LOAD_MODEL' });
         } else {
             console.error('Web Workers are not supported in this environment.');
         }
     }
 
-    public getEmbedding(imageBuffer: Float32Array | Uint8ClampedArray, width: number, height: number): Promise<number[]> {
+    /**
+     * Send raw RGBA pixel data to the worker for embedding extraction.
+     * Uses Transferable to zero-copy the buffer to the worker thread.
+     */
+    public getEmbedding(imageData: ImageData): Promise<number[]> {
         if (!this.worker) return Promise.reject('No Worker');
 
         return new Promise((resolve, reject) => {
             const id = crypto.randomUUID();
             this.pendingRequests.set(id, { resolve, reject });
 
+            // Transfer the underlying ArrayBuffer (zero-copy)
+            const buffer = imageData.data.buffer;
             this.worker!.postMessage({
                 type: 'RECOGNIZE',
-                payload: { imageBuffer, width, height, id, useBGR: this.useBGR() }
-            });
+                payload: { imageBuffer: imageData.data, id, useBGR: this.useBGR() }
+            }, [buffer]);
         });
     }
 
@@ -102,7 +108,6 @@ export class FaceRecognitionService {
         // Threshold usually 0.4 - 0.6 for ArcFace/EdgeFace
         if (bestScore > 0.4) {
             // Map 0.4 - 1.0 to 0.8 - 1.0
-            // Formula: 0.8 + (score - 0.4) * (0.2 / 0.6) = 0.8 + (score - 0.4) * 0.333
             const mappedScore = 0.8 + ((bestScore - 0.4) / 0.6) * 0.2;
             return { name: bestMatch, score: mappedScore };
         }

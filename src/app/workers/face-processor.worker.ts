@@ -10,38 +10,50 @@ addEventListener('message', async ({ data }) => {
 
     switch (type) {
         case 'LOAD_MODEL':
-            if (!session && !isLoading) {
-                isLoading = true;
-                try {
-                    // Set wasm paths - must be absolute path for module resolution
-                    ort.env.wasm.wasmPaths = '/assets/wasm/';
+            if (isLoading) return;
 
-                    session = await ort.InferenceSession.create('/assets/models/edgeface_xxs.onnx', {
-                        executionProviders: ['wasm'],
-                        graphOptimizationLevel: 'all'
-                    });
-                    postMessage({ type: 'MODEL_LOADED', payload: true });
-                } catch (e: any) {
-                    console.error('Failed to load EdgeFace:', e);
-                    postMessage({ type: 'ERROR', payload: e.message });
-                } finally {
-                    isLoading = false;
+            // Release existing session if reloading
+            if (session) {
+                try {
+                    await session.release();
+                } catch (e) {
+                    console.warn('Failed to release session:', e);
                 }
+                session = null;
+            }
+
+            isLoading = true;
+            try {
+                // Set wasm paths - must be absolute path for module resolution
+                ort.env.wasm.wasmPaths = '/assets/wasm/';
+
+                // CPU-only: WASM is the most reliable and consistent across all devices
+                const options: ort.InferenceSession.SessionOptions = {
+                    executionProviders: ['wasm'],
+                    graphOptimizationLevel: 'all'
+                };
+
+                console.log('Loading EdgeFace with CPU (WASM) backend');
+
+                session = await ort.InferenceSession.create('/assets/models/edgeface_xxs.onnx', options);
+                postMessage({ type: 'MODEL_LOADED', payload: true });
+            } catch (e: any) {
+                console.error('Failed to load EdgeFace:', e);
+                postMessage({ type: 'ERROR', payload: e.message });
+            } finally {
+                isLoading = false;
             }
             break;
 
         case 'RECOGNIZE':
             if (!session) {
-                // Return error with ID if possible, but here we just post to generic error if ID missing
-                // Actually payload should have id now.
                 const { id } = payload;
                 postMessage({ type: 'ERROR', payload: 'Model not loaded', id });
                 return;
             }
             try {
                 const { imageBuffer, id, useBGR } = payload;
-                // payload: { imageBuffer, width, height, id, useBGR }
-
+                // imageBuffer is now a Uint8ClampedArray (RGBA) transferred from main thread
                 const embedding = await runInference(imageBuffer, useBGR);
                 postMessage({ type: 'RESULT', payload: embedding, id });
             } catch (e: any) {
@@ -52,56 +64,23 @@ addEventListener('message', async ({ data }) => {
     }
 });
 
-async function runInference(inputData: Float32Array, useBGR: boolean = true): Promise<number[]> {
+async function runInference(inputData: Uint8ClampedArray, useBGR: boolean = true): Promise<number[]> {
     if (!session) throw new Error('Session null');
 
-    // Input processing: Convert RGBA/RGB to NCHW Plane format
     // Expected input: 112x112
     const width = 112;
     const height = 112;
     const totalPixels = width * height;
     const tensorData = new Float32Array(1 * 3 * width * height);
 
-    // --- PRE-PROCESSING: Histogram Equalization (Y Channel only) ---
-    // 1. Compute Histogram
-    const histogram = new Uint32Array(256).fill(0);
-    for (let i = 0; i < totalPixels; i++) {
-        const r = inputData[i * 4];
-        const g = inputData[i * 4 + 1];
-        const b = inputData[i * 4 + 2];
-        const lum = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
-        histogram[lum]++;
-    }
+    // --- PRE-PROCESSING: Standard Normalize & CHW Layout ---
+    // Convert from Uint8 RGBA to normalized Float32 NCHW in one pass
+    // (x - 127.5) / 128.0 (Standard InsightFace Normalization)
 
-    // 2. Compute CDF (Cumulative Distribution Function)
-    const cdf = new Uint32Array(256);
-    let sum = 0;
-    for (let i = 0; i < 256; i++) {
-        sum += histogram[i];
-        cdf[i] = sum;
-    }
-
-    // 3. Normalize CDF
-    const cdfMin = cdf.find(val => val > 0) || 0;
-    const map = new Uint8Array(256);
-    for (let i = 0; i < 256; i++) {
-        map[i] = Math.round(((cdf[i] - cdfMin) / (totalPixels - cdfMin)) * 255);
-    }
-
-    // 4. Apply Equalization & Normalize for Model
     for (let i = 0; i < totalPixels; i++) {
         let r = inputData[i * 4];
         let g = inputData[i * 4 + 1];
         let b = inputData[i * 4 + 2];
-
-        // Convert to YCbCr approx to apply offset to RGB
-        const y = 0.299 * r + 0.587 * g + 0.114 * b;
-        const newY = map[Math.round(y)];
-        const ratio = (y > 0) ? (newY / y) : 1;
-
-        r = Math.min(255, Math.max(0, r * ratio));
-        g = Math.min(255, Math.max(0, g * ratio));
-        b = Math.min(255, Math.max(0, b * ratio));
 
         if (useBGR) {
             // Swap for BGR
@@ -110,11 +89,11 @@ async function runInference(inputData: Float32Array, useBGR: boolean = true): Pr
             b = temp;
         }
 
-        // NCHW Layout: R, G, B (After optional swap)
-        // If BGR, then R-plane holds B, etc.
-        tensorData[i] = (r - 127.5) / 127.5;
-        tensorData[i + totalPixels] = (g - 127.5) / 127.5;
-        tensorData[i + 2 * totalPixels] = (b - 127.5) / 127.5;
+        // NCHW Layout: R, G, B (Planar)
+        // Normalize: (Val - 127.5) / 128.0
+        tensorData[i] = (r - 127.5) / 128.0;
+        tensorData[i + totalPixels] = (g - 127.5) / 128.0;
+        tensorData[i + 2 * totalPixels] = (b - 127.5) / 128.0;
     }
 
     const feeds: Record<string, ort.Tensor> = {};
@@ -122,7 +101,6 @@ async function runInference(inputData: Float32Array, useBGR: boolean = true): Pr
 
     const results = await session.run(feeds);
 
-    // Output usually named 'embedding', 'output', 'features' etc.
     const outputName = session.outputNames[0];
     const outputTensor = results[outputName];
 

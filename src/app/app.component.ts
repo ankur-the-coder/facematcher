@@ -21,10 +21,18 @@ export class AppComponent {
   isCameraActive = signal(false);
   fps = signal(0);
   currentMatch = signal<string>("Unknown");
+  showSidebar = signal(false); // For mobile drawer
+
   private lastFrameTime = 0;
   private captureNextFrame = false;
 
+  // Reusable OffscreenCanvas for face cropping (avoids GC pressure)
+  private cropCanvas: OffscreenCanvas | null = null;
+  private cropCtx: OffscreenCanvasRenderingContext2D | null = null;
 
+  // FPS throttle: update display only every 500ms
+  private fpsFrameCount = 0;
+  private fpsLastUpdate = 0;
 
   knownFaces = signal<KnownFace[]>([]);
 
@@ -52,7 +60,6 @@ export class AppComponent {
     video.play();
 
     video.onloadedmetadata = () => {
-      // Start Render Loop
       this.processFrame();
     };
   }
@@ -69,13 +76,15 @@ export class AppComponent {
       return;
     }
 
-    // FPS Calculation
+    // FPS Calculation (throttled — update every 500ms)
     const now = performance.now();
-    if (this.lastFrameTime !== 0) {
-      const delta = now - this.lastFrameTime;
-      this.fps.set(Math.round(1000 / delta));
+    this.fpsFrameCount++;
+    if (now - this.fpsLastUpdate >= 500) {
+      const elapsed = now - this.fpsLastUpdate;
+      this.fps.set(Math.round((this.fpsFrameCount / elapsed) * 1000));
+      this.fpsFrameCount = 0;
+      this.fpsLastUpdate = now;
     }
-    this.lastFrameTime = now;
 
     // Match canvas size to video
     if (canvas.width !== video.videoWidth) {
@@ -86,17 +95,22 @@ export class AppComponent {
     // 1. Detect
     const results = await this.detectionService.detect(video, performance.now());
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height); // Clear previous
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     if (results && results.faceLandmarks.length > 0) {
-      for (let i = 0; i < results.faceLandmarks.length; i++) {
-        const landmarks = results.faceLandmarks[i]; // Normalized 0-1
+      // Initialize reusable crop canvas once
+      if (!this.cropCanvas) {
+        this.cropCanvas = new OffscreenCanvas(112, 112);
+        this.cropCtx = this.cropCanvas.getContext('2d')!;
+      }
 
-        // 2. Draw Bounding Box (Rough estimation from landmarks)
+      for (let i = 0; i < results.faceLandmarks.length; i++) {
+        const landmarks = results.faceLandmarks[i];
+
+        // 2. Draw Bounding Box
         const box = this.getBoundingBox(landmarks, canvas.width, canvas.height);
 
         // MIRROR BOX due to CSS mirror on video
-        // x becomes (width - x - w)
         const mirroredBox = {
           ...box,
           x: canvas.width - box.x - box.w
@@ -104,9 +118,7 @@ export class AppComponent {
 
         this.drawBox(ctx, mirroredBox);
 
-        // 3. Align & Crop (Uses RAW video, so use RAW landmarks)
-        // We need specific landmarks: LeftEye(468?), RightEye(473?)...
-        // Use Stable Landmarks (Eye Corners average) to avoid gaze jitter
+        // 3. Align & Crop
         const p33 = landmarks[33];
         const p133 = landmarks[133];
         const p362 = landmarks[362];
@@ -125,25 +137,21 @@ export class AppComponent {
         // 4. Transform
         const matrix = estimateAffineTransform(keyPoints);
 
-        // 5. Warp (Async - maybe skip frames if busy)
+        // 5. Warp
         try {
           const warpedBitmap = await warpFace(video, matrix);
 
-          // Get buffer from bitmap
-          const warpedCanvas = new OffscreenCanvas(112, 112);
-          const wCtx = warpedCanvas.getContext('2d')!;
+          // Reuse the crop canvas instead of allocating new one each frame
+          const wCtx = this.cropCtx!;
           wCtx.drawImage(warpedBitmap, 0, 0);
           const imgData = wCtx.getImageData(0, 0, 112, 112);
 
-          // 6. Recognize
-          const embedding = await this.recognitionService.getEmbedding(
-            new Float32Array(imgData.data), 112, 112
-          );
+          // 6. Recognize — sends ImageData directly, buffer transferred (zero-copy)
+          const embedding = await this.recognitionService.getEmbedding(imgData);
 
           if (this.captureNextFrame) {
             this.captureNextFrame = false;
-            // Convert to blob for display
-            const blob = await warpedCanvas.convertToBlob();
+            const blob = await this.cropCanvas!.convertToBlob();
             const url = URL.createObjectURL(blob);
             const name = `Live_${new Date().toLocaleTimeString().replace(/:/g, '')}`;
             this.recognitionService.addKnownFace(name, embedding, url);
@@ -154,10 +162,8 @@ export class AppComponent {
           const match = this.recognitionService.matchFace(embedding);
 
           if (match) {
-            console.log(`Match: ${match.name} (${match.score.toFixed(2)})`);
             this.currentMatch.set(`${match.name} (${(match.score * 100).toFixed(0)}%)`);
           } else {
-            // console.log('No match found');
             this.currentMatch.set("Unknown");
           }
 
@@ -202,20 +208,14 @@ export class AppComponent {
     const textWidth = ctx.measureText(label).width;
     const padding = 6;
 
-    // Ensure y is visible
     let y = box.y - 10;
     if (y < 25) y = box.y + box.h + 25;
 
-    // Draw Background
     ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
     ctx.fillRect(box.x, y - 18, textWidth + padding * 2, 24);
 
-    // Draw Text
     ctx.fillStyle = '#00ff00';
     ctx.fillText(label, box.x + padding, y);
-
-    // Console log to confirm drawing
-    // console.log('Drawing Label:', label, 'at', box.x, y); 
   }
 
   async handleUpload(event: Event) {
@@ -239,16 +239,11 @@ export class AppComponent {
       img.onerror = reject;
     });
 
-    // We need to detect face in this image to align it!
-    // For simplicity, let's assume one face.
     const results = await this.detectionService.detectImage(img);
-
-    // Switch back to VIDEO mode for live camera detection
     await this.detectionService.switchToVideoMode();
 
     if (results && results.faceLandmarks.length > 0) {
       const landmarks = results.faceLandmarks[0];
-      // Align with Stable Landmarks
       const p33 = landmarks[33];
       const p133 = landmarks[133];
       const p362 = landmarks[362];
@@ -272,12 +267,8 @@ export class AppComponent {
       wCtx.drawImage(warpedBitmap, 0, 0);
       const imgData = wCtx.getImageData(0, 0, 112, 112);
 
-      // Get embedding
-      const embedding = await this.recognitionService.getEmbedding(
-        new Float32Array(imgData.data), 112, 112
-      );
+      const embedding = await this.recognitionService.getEmbedding(imgData);
 
-      // Save (Use the cropped face as thumbnail)
       const thumbBlob = await warpedCanvas.convertToBlob();
       const thumbUrl = URL.createObjectURL(thumbBlob);
 
@@ -292,13 +283,18 @@ export class AppComponent {
       this.recognitionService.deleteKnownFace(face);
     }
   }
+
   triggerSnapshot() {
     this.captureNextFrame = true;
   }
 
   toggleColorMode() {
     this.recognitionService.useBGR.update(v => !v);
-    this.recognitionService.knownFaces.set([]); // Clear faces to prevent mismatch
+    this.recognitionService.knownFaces.set([]);
     this.currentMatch.set("Unknown");
+  }
+
+  toggleSidebar() {
+    this.showSidebar.update(v => !v);
   }
 }
